@@ -176,6 +176,26 @@ class LayoutMixin:
         self.classifier_combo.pack(fill=tk.X, pady=(0, 3))
         self.classifier_combo.bind('<<ComboboxSelected>>', self._on_classifier_changed)
 
+        if not hasattr(self, 'occupied_conf_threshold_var'):
+            self.occupied_conf_threshold_var = tk.DoubleVar(value=30.0)
+
+        conf_gate_frame = ttk.Frame(parent, style='TFrame')
+        conf_gate_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(conf_gate_frame, text="OCC Gate (%):", font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT)
+        ttk.Spinbox(conf_gate_frame, from_=0, to=100, increment=1, width=6,
+                    textvariable=self.occupied_conf_threshold_var).pack(side=tk.LEFT, padx=(6, 0))
+
+        if not hasattr(self, 'ensemble_area_pct_var'):
+            default_area = 49.0
+            if hasattr(classification, 'get_ensemble_inner_area_pct'):
+                default_area = float(classification.get_ensemble_inner_area_pct())
+            self.ensemble_area_pct_var = tk.DoubleVar(value=default_area)
+        ens_area_frame = ttk.Frame(parent, style='TFrame')
+        ens_area_frame.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(ens_area_frame, text="ENS Area (%):", font=('Segoe UI', 9, 'bold')).pack(side=tk.LEFT)
+        ttk.Spinbox(ens_area_frame, from_=4, to=100, increment=1, width=6,
+                    textvariable=self.ensemble_area_pct_var).pack(side=tk.LEFT, padx=(6, 0))
+
         ttk.Button(parent, text="Run ROI Classification",
                    command=self._classify, style='Accent.TButton').pack(
                        fill=tk.X, pady=2)

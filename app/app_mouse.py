@@ -5,6 +5,39 @@ from constants import LINE_FOCUS_THRESHOLD
 import grid_helpers
 
 class MouseMixin:
+    def _find_grid_group_for_slot(self, slot_idx: int) -> int:
+        for gi, group in enumerate(getattr(self, 'grid_groups', [])):
+            start = int(group.get('start', 0))
+            count = int(group.get('count', 0))
+            if start <= slot_idx < (start + count):
+                return gi
+        return -1
+
+    def _collect_linked_corners(self, slot_idx: int, corner_idx: int,
+                                match_threshold: float = 2.5):
+        if slot_idx < 0 or slot_idx >= len(self.slots):
+            return []
+        if corner_idx < 0 or corner_idx >= 4:
+            return []
+
+        group_idx = self._find_grid_group_for_slot(slot_idx)
+        if group_idx < 0:
+            return []
+
+        group = self.grid_groups[group_idx]
+        start = max(0, int(group.get('start', 0)))
+        count = max(0, int(group.get('count', 0)))
+        end = min(len(self.slots), start + count)
+
+        anchor = np.array(self.slots[slot_idx].pts[corner_idx], dtype=np.float32)
+        linked = []
+        for si in range(start, end):
+            for ci, p in enumerate(self.slots[si].pts):
+                pt = np.array(p, dtype=np.float32)
+                if float(np.linalg.norm(pt - anchor)) <= float(match_threshold):
+                    linked.append((si, ci, float(p[0]), float(p[1])))
+        return linked
+
     def _on_click(self, event):
         if self.img_cv is None:
             return
@@ -94,22 +127,16 @@ class MouseMixin:
                     self.grid_bounds = self.grid_groups[group_idx]['bounds']
                     self.status_var.set("Drag grid corner to reshape this auto grid.")
                     return
-                if group_idx >= 0 and gei >= 0:
-                    self._snapshot()
-                    self.dragging_grid_group = group_idx
-                    self.dragging_grid_edge = gei
-                    self.active_grid_group = group_idx
-                    self.grid_bounds_orig = copy.deepcopy(self.grid_groups[group_idx]['bounds'])
-                    self.grid_bounds = copy.deepcopy(self.grid_groups[group_idx]['bounds'])
-                    self.drag_start = (ix, iy)
-                    self.status_var.set("Drag grid edge to reshape this auto grid.")
-                    return
             if self.selected >= 0:
                 s = self.slots[self.selected]
                 ci = s.nearest_corner(ix, iy, int(15 / self.zoom))
                 if ci >= 0:
                     self._snapshot()
                     self.dragging_corner = ci
+                    self.drag_corner_anchor_start = [float(s.pts[ci][0]), float(s.pts[ci][1])]
+                    self.drag_linked_corners = self._collect_linked_corners(self.selected, ci)
+                    if len(self.drag_linked_corners) <= 1:
+                        self.drag_linked_corners = []
                     return
                 edge_i = s.nearest_edge(ix, iy, int(15 / self.zoom))
                 if edge_i >= 0:
@@ -128,6 +155,10 @@ class MouseMixin:
                     self.selected = i
                     self._snapshot()
                     self.dragging_corner = ci
+                    self.drag_corner_anchor_start = [float(s.pts[ci][0]), float(s.pts[ci][1])]
+                    self.drag_linked_corners = self._collect_linked_corners(self.selected, ci)
+                    if len(self.drag_linked_corners) <= 1:
+                        self.drag_linked_corners = []
                     self._refresh_list()
                     self._redraw()
                     return
@@ -166,19 +197,6 @@ class MouseMixin:
                     self.select_drag_start = None
                     self.select_drag_box = None
                     self.status_var.set("Drag selected grid corner to reshape this auto grid.")
-                    return
-                if group_idx >= 0 and gei >= 0:
-                    self._snapshot()
-                    self.dragging_grid_group = group_idx
-                    self.dragging_grid_edge = gei
-                    self.active_grid_group = group_idx
-                    self.hovered_grid_group = group_idx
-                    self.grid_bounds_orig = copy.deepcopy(self.grid_groups[group_idx]['bounds'])
-                    self.grid_bounds = copy.deepcopy(self.grid_groups[group_idx]['bounds'])
-                    self.drag_start = (ix, iy)
-                    self.select_drag_start = None
-                    self.select_drag_box = None
-                    self.status_var.set("Drag selected grid edge to reshape this auto grid.")
                     return
                 if group_idx >= 0:
                     self.active_grid_group = group_idx
@@ -255,7 +273,17 @@ class MouseMixin:
             return
 
         if self.dragging_corner >= 0 and self.selected >= 0:
-            self.slots[self.selected].pts[self.dragging_corner] = [ix, iy]
+            linked = getattr(self, 'drag_linked_corners', None)
+            anchor_start = getattr(self, 'drag_corner_anchor_start', None)
+            if linked and anchor_start is not None:
+                dx = float(ix) - float(anchor_start[0])
+                dy = float(iy) - float(anchor_start[1])
+                for si, ci, bx, by in linked:
+                    nx = max(0, min(w - 1, int(round(float(bx) + dx))))
+                    ny = max(0, min(h - 1, int(round(float(by) + dy))))
+                    self.slots[si].pts[ci] = [nx, ny]
+            else:
+                self.slots[self.selected].pts[self.dragging_corner] = [ix, iy]
             self._redraw()
         elif self.dragging_slot and self.selected >= 0:
             s = self.slots[self.selected]
@@ -324,6 +352,8 @@ class MouseMixin:
         self.dragging_grid_corner = -1
         self.dragging_grid_edge = -1
         self.dragging_grid_group = -1
+        self.drag_corner_anchor_start = None
+        self.drag_linked_corners = []
 
     def _on_right_click(self, event):
         if self.mode == 'draw' and self.draw_pts:

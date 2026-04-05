@@ -15,6 +15,7 @@ import os
 import sys
 import tkinter as tk
 
+import classification
 from app_core import AppLogic
 from app_drawing import DrawingMixin
 from app_layout import LayoutMixin
@@ -68,6 +69,8 @@ class App(tk.Tk, LayoutMixin, DrawingMixin, MouseMixin, AppLogic):
         self._prev_hovered_grid_edge = -1
         self.drag_start = (0, 0)
         self.drag_slot_offsets = []
+        self.drag_corner_anchor_start = None
+        self.drag_linked_corners = []
         self.draw_preview_pt = None
 
         self.grid_pts = []
@@ -79,6 +82,9 @@ class App(tk.Tk, LayoutMixin, DrawingMixin, MouseMixin, AppLogic):
         self._prev_hovered_grid_group = -1
         self.grid_rows = tk.IntVar(value=2)
         self.grid_cols = tk.IntVar(value=8)
+        self.occupied_conf_threshold_var = tk.DoubleVar(value=30.0)
+        self.ensemble_area_pct_var = tk.DoubleVar(
+            value=float(classification.get_ensemble_inner_area_pct()))
         self.tile_rows_var = tk.IntVar(value=1)
         self.tile_cols_var = tk.IntVar(value=1)
         self.select_drag_start = None

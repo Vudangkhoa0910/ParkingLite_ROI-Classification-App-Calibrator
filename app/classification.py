@@ -29,11 +29,16 @@ P75_THRESHOLD = 30.0
 MAX_BLOCK_THRESHOLD = 36.0
 HIST_INTERSECTION_THRESHOLD = 0.84
 VAR_RATIO_THRESHOLD = 1.45
+ENSEMBLE_INNER_RATIO = 0.70
+ENSEMBLE_INNER_AREA_PCT_DEFAULT = ENSEMBLE_INNER_RATIO * ENSEMBLE_INNER_RATIO * 100.0
+
+_ensemble_inner_area_pct = float(ENSEMBLE_INNER_AREA_PCT_DEFAULT)
 
 
 def preprocess_roi(roi):
+    roi_u8 = np.asarray(roi, dtype=np.uint8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    roi_eq = clahe.apply(roi)
+    roi_eq = clahe.apply(roi_u8)
     roi_blur = cv2.GaussianBlur(roi_eq, (5, 5), 0)
     return roi_blur
 
@@ -48,17 +53,52 @@ def normalize_classifier_key(method_key: str) -> str:
     return method_key if method_key in valid else DEFAULT_CLASSIFIER
 
 
-def _build_gaussian_kernel(size: int = ROI_SIZE) -> np.ndarray:
-    sigma = size / 3.0
-    ax = np.arange(size, dtype=np.float32) - (size / 2.0) + 0.5
-    xx, yy = np.meshgrid(ax, ax)
-    kernel = np.exp(-((xx * xx) + (yy * yy)) / (2.0 * sigma * sigma))
+def set_ensemble_inner_area_pct(area_pct: float) -> float:
+    global _ensemble_inner_area_pct
+    try:
+        value = float(area_pct)
+    except Exception:
+        value = float(ENSEMBLE_INNER_AREA_PCT_DEFAULT)
+    _ensemble_inner_area_pct = float(np.clip(value, 4.0, 100.0))
+    return _ensemble_inner_area_pct
+
+
+def get_ensemble_inner_area_pct() -> float:
+    return float(_ensemble_inner_area_pct)
+
+
+def _ensemble_inner_side_ratio() -> float:
+    return float(np.sqrt(np.clip(get_ensemble_inner_area_pct() / 100.0, 0.04, 1.0)))
+
+
+def _build_gaussian_kernel(height: int = ROI_SIZE,
+                           width: int = ROI_SIZE) -> np.ndarray:
+    sigma_x = width / 3.0
+    sigma_y = height / 3.0
+    ax = np.arange(width, dtype=np.float32) - (width / 2.0) + 0.5
+    ay = np.arange(height, dtype=np.float32) - (height / 2.0) + 0.5
+    xx, yy = np.meshgrid(ax, ay)
+    kernel = np.exp(-((xx * xx) / (2.0 * sigma_x * sigma_x)
+                      + (yy * yy) / (2.0 * sigma_y * sigma_y)))
     kernel = kernel / np.sum(kernel)
     # Keep weighted MAD on the same order of magnitude as plain MAD.
-    return kernel * float(size * size)
+    return kernel * float(height * width)
 
 
 _GAUSS_KERNEL = _build_gaussian_kernel()
+
+
+def _center_crop_ratio(roi: np.ndarray,
+                       ratio: float = ENSEMBLE_INNER_RATIO) -> np.ndarray:
+    h, w = roi.shape[:2]
+    ratio = float(np.clip(ratio, 0.20, 1.0))
+    inner_h = max(4, int(round(h * ratio)))
+    inner_w = max(4, int(round(w * ratio)))
+    y0 = max(0, (h - inner_h) // 2)
+    x0 = max(0, (w - inner_w) // 2)
+    y1 = min(h, y0 + inner_h)
+    x1 = min(w, x0 + inner_w)
+    return roi[y0:y1, x0:x1]
 
 
 def _compute_similarity_metrics(ref_pre: np.ndarray, test_pre: np.ndarray) -> Tuple[float, float, float]:
@@ -94,7 +134,8 @@ def _compute_similarity_metrics(ref_pre: np.ndarray, test_pre: np.ndarray) -> Tu
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
-    diff_ratio = int(np.count_nonzero(thresh)) / float(ROI_SIZE * ROI_SIZE)
+    area = float(max(1, thresh.shape[0] * thresh.shape[1]))
+    diff_ratio = int(np.count_nonzero(thresh)) / area
 
     edge_ref = cv2.Canny(ref_pre, 50, 150)
     edge_test = cv2.Canny(test_pre, 50, 150)
@@ -104,19 +145,21 @@ def _compute_similarity_metrics(ref_pre: np.ndarray, test_pre: np.ndarray) -> Tu
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
-    edge_ratio = float(np.count_nonzero(edge_diff)) / float(ROI_SIZE * ROI_SIZE)
+    edge_ratio = float(np.count_nonzero(edge_diff)) / area
 
     return mean_ssim, diff_ratio, edge_ratio
 
 
 def _block_stats(diff_map: np.ndarray, block_size: int = 8) -> Tuple[float, float]:
-    n_blocks = ROI_SIZE // block_size
-    total_blocks = n_blocks * n_blocks
+    h, w = diff_map.shape[:2]
+    n_blocks_y = max(1, h // block_size)
+    n_blocks_x = max(1, w // block_size)
+    total_blocks = n_blocks_y * n_blocks_x
     occupied_blocks = 0
     max_block_mad = 0.0
 
-    for by in range(n_blocks):
-        for bx in range(n_blocks):
+    for by in range(n_blocks_y):
+        for bx in range(n_blocks_x):
             y0 = by * block_size
             x0 = bx * block_size
             block = diff_map[y0:y0 + block_size, x0:x0 + block_size]
@@ -143,6 +186,43 @@ def _variance_ratio(ref_pre: np.ndarray, test_pre: np.ndarray) -> float:
     ref_var = max(float(np.var(ref_pre.astype(np.float32))), 1.0)
     test_var = max(float(np.var(test_pre.astype(np.float32))), 1.0)
     return test_var / ref_var
+
+
+def _to_u8_for_display(img: np.ndarray) -> np.ndarray:
+    arr = np.asarray(img)
+    if arr.dtype == np.uint8:
+        return arr.copy()
+
+    arr_f = arr.astype(np.float32)
+    finite_mask = np.isfinite(arr_f)
+    if not np.any(finite_mask):
+        return np.zeros(arr_f.shape, dtype=np.uint8)
+
+    valid = arr_f[finite_mask]
+    lo = float(np.min(valid))
+    hi = float(np.max(valid))
+    if abs(hi - lo) < 1e-6:
+        return np.zeros(arr_f.shape, dtype=np.uint8)
+    norm = (arr_f - lo) / (hi - lo)
+    return np.clip(norm * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def roi_debug_steps(ref_roi: np.ndarray, test_roi: np.ndarray,
+                    method_key: str = DEFAULT_CLASSIFIER) -> List[Tuple[str, np.ndarray]]:
+    ref_raw = _to_u8_for_display(ref_roi)
+    test_raw = _to_u8_for_display(test_roi)
+    ref_pre = preprocess_roi(ref_raw)
+    test_pre = preprocess_roi(test_raw)
+
+    steps: List[Tuple[str, np.ndarray]] = [
+        ("ref_raw", ref_raw),
+        ("test_raw", test_raw),
+        ("ref_pre", ref_pre),
+        ("test_pre", test_pre),
+        ("diff_pre", cv2.absdiff(test_pre, ref_pre)),
+    ]
+
+    return steps
 
 
 def _norm_above(value: float, threshold: float, band: float) -> float:
@@ -174,15 +254,26 @@ def classify_roi(ref_roi: np.ndarray, test_roi: np.ndarray,
 
     ref_pre = preprocess_roi(ref_roi)
     test_pre = preprocess_roi(test_roi)
-    mean_ssim, diff_ratio, edge_ratio = _compute_similarity_metrics(ref_pre, test_pre)
+    ref_eval = ref_pre
+    test_eval = test_pre
+    ensemble_inner_ratio = _ensemble_inner_side_ratio()
+    if method_key == "roi_ensemble":
+        ref_eval = _center_crop_ratio(ref_pre, ensemble_inner_ratio)
+        test_eval = _center_crop_ratio(test_pre, ensemble_inner_ratio)
 
-    diff_map = cv2.absdiff(test_pre, ref_pre).astype(np.float32)
+    mean_ssim, diff_ratio, edge_ratio = _compute_similarity_metrics(ref_eval, test_eval)
+
+    diff_map = cv2.absdiff(test_eval, ref_eval).astype(np.float32)
     mad = float(np.mean(diff_map))
-    gaussian_mad = float(np.sum(diff_map * _GAUSS_KERNEL) / float(ROI_SIZE * ROI_SIZE))
+    gauss_kernel = _GAUSS_KERNEL
+    if gauss_kernel.shape != diff_map.shape:
+        gauss_kernel = _build_gaussian_kernel(diff_map.shape[0], diff_map.shape[1])
+    diff_area = float(max(1, diff_map.shape[0] * diff_map.shape[1]))
+    gaussian_mad = float(np.sum(diff_map * gauss_kernel) / diff_area)
     block_vote_ratio, max_block_mad = _block_stats(diff_map)
     p75_mad = float(np.percentile(diff_map, 75))
-    hist_inter = _histogram_intersection(ref_pre, test_pre)
-    var_ratio = _variance_ratio(ref_pre, test_pre)
+    hist_inter = _histogram_intersection(ref_eval, test_eval)
+    var_ratio = _variance_ratio(ref_eval, test_eval)
 
     metrics = {
         "mean_ssim": mean_ssim,
@@ -195,6 +286,8 @@ def classify_roi(ref_roi: np.ndarray, test_roi: np.ndarray,
         "max_block_mad": max_block_mad,
         "hist_intersection": hist_inter,
         "variance_ratio": var_ratio,
+        "ensemble_inner_ratio": float(ensemble_inner_ratio),
+        "ensemble_inner_area_pct": float(get_ensemble_inner_area_pct()),
     }
 
     if method_key == "legacy_ssim_edge":

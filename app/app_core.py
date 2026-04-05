@@ -16,6 +16,11 @@ import classification
 import grid_helpers
 
 
+OCCUPIED_CONFIDENCE_DEFAULT_PCT = 30.0
+ENSEMBLE_AREA_DEFAULT_PCT = float(classification.get_ensemble_inner_area_pct()) \
+    if hasattr(classification, 'get_ensemble_inner_area_pct') else 49.0
+
+
 class AppLogic:
     def _bind_keys(self):
         self.bind('<Delete>', lambda e: self._delete_selected())
@@ -64,6 +69,36 @@ class AppLogic:
         if path:
             self._load_image(path)
 
+    def _roi_space_shape(self):
+        # ROI coordinates are authored in img_cv space.
+        if self.img_cv is not None:
+            return self.img_cv.shape[:2]
+        if self.ref_cv is not None:
+            return self.ref_cv.shape[:2]
+        return None
+
+    def _resize_to_shape(self, img, target_shape):
+        if img is None or target_shape is None:
+            return img, False
+        if img.shape[:2] == target_shape:
+            return img, False
+        resized = cv2.resize(img, (target_shape[1], target_shape[0]),
+                             interpolation=cv2.INTER_LINEAR)
+        return resized, True
+
+    def _align_test_to_reference(self, update_display=False):
+        if self.test_cv is None or self.ref_cv is None:
+            return False
+        aligned, changed = self._resize_to_shape(self.test_cv, self.ref_cv.shape[:2])
+        if not changed:
+            return False
+        self.test_cv = aligned
+        self.test_pil = Image.fromarray(cv2.cvtColor(self.test_cv, cv2.COLOR_BGR2RGB))
+        if update_display:
+            self._display_cv = self.test_cv
+            self._display_pil = self.test_pil
+        return True
+
     def _load_image(self, path, is_test=False):
         img = cv2.imread(path)
         if img is None:
@@ -73,12 +108,11 @@ class AppLogic:
         if is_test:
             self.test_path = path
             self.test_label.configure(text=f"Test: {os.path.basename(path)}")
-            if self.ref_cv is not None and self.ref_path != path:
-                if self.ref_cv.shape[:2] != img.shape[:2]:
-                    img = cv2.resize(img, (self.ref_cv.shape[1], self.ref_cv.shape[0]),
-                                     interpolation=cv2.INTER_LINEAR)
-                    self.status_var.set(
-                        f"Resized TEST image to match Reference size {self.ref_cv.shape[1]}x{self.ref_cv.shape[0]}")
+            target_shape = self._roi_space_shape()
+            img, resized = self._resize_to_shape(img, target_shape)
+            if resized and target_shape is not None:
+                self.status_var.set(
+                    f"Resized TEST image to ROI size {target_shape[1]}x{target_shape[0]}")
             self.test_cv = img
             self.test_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             self._display_cv = self.test_cv
@@ -168,6 +202,38 @@ class AppLogic:
             return self.classifier_label_to_key.get(label, classification.DEFAULT_CLASSIFIER)
         return classification.DEFAULT_CLASSIFIER
 
+    def _prediction_from_classifier(self, clf) -> int:
+        occupied_raw = bool(clf.get('occupied', False))
+        if not occupied_raw:
+            return 0
+
+        confidence = float(clf.get('confidence', 0.0))
+        threshold_pct = OCCUPIED_CONFIDENCE_DEFAULT_PCT
+        if hasattr(self, 'occupied_conf_threshold_var'):
+            try:
+                threshold_pct = float(self.occupied_conf_threshold_var.get())
+            except Exception:
+                threshold_pct = OCCUPIED_CONFIDENCE_DEFAULT_PCT
+
+        threshold_pct = float(np.clip(threshold_pct, 0.0, 100.0))
+        threshold_ratio = threshold_pct / 100.0
+        if threshold_ratio <= 0.0:
+            return 1
+        return 1 if confidence > threshold_ratio else 0
+
+    def _apply_ensemble_area_setting(self) -> float:
+        area_pct = ENSEMBLE_AREA_DEFAULT_PCT
+        if hasattr(classification, 'get_ensemble_inner_area_pct'):
+            area_pct = float(classification.get_ensemble_inner_area_pct())
+        if hasattr(self, 'ensemble_area_pct_var'):
+            try:
+                area_pct = float(self.ensemble_area_pct_var.get())
+            except Exception:
+                pass
+        if hasattr(classification, 'set_ensemble_inner_area_pct'):
+            return float(classification.set_ensemble_inner_area_pct(area_pct))
+        return area_pct
+
     def _on_classifier_changed(self, _event=None):
         method_key = self._selected_classifier_key()
         self.status_var.set(f"Classification method: {classification.classifier_label(method_key)}")
@@ -214,7 +280,7 @@ class AppLogic:
         messages = {
             'draw': "DRAW MODE — Click 4 corners (clockwise or counter-clockwise) to create a slot",
             'edit': "EDIT MODE — Click to select, drag corners to reshape, drag body to move",
-            'select': "SELECT GRID MODE — Click an existing grid to select it, then drag corners or edges",
+                'select': "SELECT GRID MODE — Click an existing grid to select it, then drag outer corners",
             'grid': f"GRID MODE — Click 4 corners of parking area (TL → TR → BR → BL), "
                     f"then auto-generate {self.grid_rows.get()}x{self.grid_cols.get()} grid",
             'tile': f"TILE MODE — Click 4 corners for template box (split by {self.tile_rows_var.get()}x{self.tile_cols_var.get()}), "
@@ -574,13 +640,27 @@ class AppLogic:
             return 0, 0
 
         drag = np.array([ix, iy], dtype=np.float32) - np.array(self.tile_drag_start, dtype=np.float32)
+
+        def round_half_away_from_zero(value: float) -> int:
+            return int(np.sign(value) * np.floor(abs(value) + 0.5))
+
+        # Decompose drag on the tile basis directly so skewed quads still follow
+        # drag direction naturally (same feel as move/edit drag).
+        basis = np.column_stack((width_axis, height_axis))
+        det = float(np.linalg.det(basis))
+        if abs(det) > 1e-6:
+            coeffs = np.linalg.solve(basis, drag)
+            step_u = round_half_away_from_zero(float(coeffs[0]))
+            step_v = round_half_away_from_zero(float(coeffs[1]))
+            return step_u, step_v
+
+        # Fallback for near-degenerate shapes.
         width_unit = width_axis / width_len
         height_unit = height_axis / height_len
         proj_w = float(np.dot(drag, width_unit))
         proj_h = float(np.dot(drag, height_unit))
-
-        step_u = int(np.sign(proj_w) * int(abs(proj_w) / width_len + 0.5))
-        step_v = int(np.sign(proj_h) * int(abs(proj_h) / height_len + 0.5))
+        step_u = round_half_away_from_zero(proj_w / width_len)
+        step_v = round_half_away_from_zero(proj_h / height_len)
         return step_u, step_v
 
     def _build_tile_group_slots(self, start_idx: int, u_min: int, u_max: int,
@@ -737,24 +817,33 @@ class AppLogic:
             if ref_img is None:
                 messagebox.showerror("Error", f"Cannot load reference image: {path}")
                 return
+
+            # If the user is currently viewing TEST, preserve that after alignment.
+            was_showing_test = (self._display_cv is self.test_cv) or (self._display_pil is self.test_pil)
+
+            target_shape = self.img_cv.shape[:2] if self.img_cv is not None else None
+            ref_img, ref_resized = self._resize_to_shape(ref_img, target_shape)
+
             self.ref_path = path
             self.ref_cv = ref_img
             self.ref_pil = Image.fromarray(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB))
             self.ref_label.configure(text=f"Ref: {os.path.basename(path)}")
             self._update_detected_lines()
-            self.status_var.set(
-                f"Reference image set: {os.path.basename(path)}")
 
-            if self.test_cv is not None and self.test_cv.shape[:2] != ref_img.shape[:2]:
-                self.test_cv = cv2.resize(self.test_cv,
-                                          (ref_img.shape[1], ref_img.shape[0]),
-                                          interpolation=cv2.INTER_LINEAR)
-                self.test_pil = Image.fromarray(cv2.cvtColor(self.test_cv, cv2.COLOR_BGR2RGB))
-                if self._display_cv is self.test_cv or self._display_pil is self.test_pil:
-                    self._display_cv = self.test_cv
-                    self._display_pil = self.test_pil
+            test_resized = self._align_test_to_reference(update_display=was_showing_test)
+
+            if was_showing_test and test_resized:
+                self._redraw()
+
+            if test_resized:
                 self.status_var.set(
-                    f"Resized TEST image to match new Reference size {ref_img.shape[1]}x{ref_img.shape[0]}")
+                    f"Resized TEST image to ROI size {self.ref_cv.shape[1]}x{self.ref_cv.shape[0]}")
+            elif ref_resized and target_shape is not None:
+                self.status_var.set(
+                    f"Reference image resized to ROI size {target_shape[1]}x{target_shape[0]}")
+            else:
+                self.status_var.set(
+                    f"Reference image set: {os.path.basename(path)}")
 
     def _set_test(self):
         path = filedialog.askopenfilename(
@@ -765,29 +854,33 @@ class AppLogic:
 
     def _classify(self):
         if not self.ref_path or not self.test_path:
-            messagebox.showinfo("Classification",
-                "Please set both Reference and Test images first.")
+            self.status_var.set("Classification skipped: set both Reference and Test images first.")
             return
         if not self.slots:
-            messagebox.showinfo("Classification", "No slots defined.")
+            self.status_var.set("Classification skipped: no slots defined.")
             return
 
-        ref = cv2.imread(self.ref_path, cv2.IMREAD_GRAYSCALE)
-        test = cv2.imread(self.test_path, cv2.IMREAD_GRAYSCALE)
-        if ref is None or test is None:
-            messagebox.showerror("Error", "Cannot load ref/test images")
+        AppLogic._apply_ensemble_area_setting(self)
+
+        ref_bgr = self.ref_cv if self.ref_cv is not None else cv2.imread(self.ref_path)
+        test_bgr = self.test_cv if self.test_cv is not None else cv2.imread(self.test_path)
+        if ref_bgr is None or test_bgr is None:
+            self.status_var.set("Classification failed: cannot load reference/test images.")
             return
 
-        if ref.shape[:2] != test.shape[:2]:
-            test = cv2.resize(test, (ref.shape[1], ref.shape[0]),
-                               interpolation=cv2.INTER_LINEAR)
-            self.test_cv = test
-            self.test_pil = Image.fromarray(cv2.cvtColor(test, cv2.COLOR_BGR2RGB))
+        if ref_bgr.shape[:2] != test_bgr.shape[:2]:
+            test_bgr = cv2.resize(test_bgr, (ref_bgr.shape[1], ref_bgr.shape[0]),
+                                  interpolation=cv2.INTER_LINEAR)
+            self.test_cv = test_bgr
+            self.test_pil = Image.fromarray(cv2.cvtColor(test_bgr, cv2.COLOR_BGR2RGB))
             self.status_var.set(
-                f"Resized TEST image to match Reference size {ref.shape[1]}x{ref.shape[0]} for classification")
+                f"Resized TEST image to ROI size {ref_bgr.shape[1]}x{ref_bgr.shape[0]} for classification")
             if self._display_cv is not None and self.test_path:
                 self._display_cv = self.test_cv
                 self._display_pil = self.test_pil
+
+        ref = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY) if len(ref_bgr.shape) == 3 else ref_bgr
+        test = cv2.cvtColor(test_bgr, cv2.COLOR_BGR2GRAY) if len(test_bgr.shape) == 3 else test_bgr
 
         method_key = self._selected_classifier_key()
         method_name = classification.classifier_label(method_key)
@@ -803,7 +896,7 @@ class AppLogic:
             clf = classification.classify_roi(ref_roi, test_roi, method_key)
             s.mad_value = round(float(clf['metric_value']), 1)
             s.confidence = round(float(clf['confidence']), 2)
-            s.prediction = 1 if clf['occupied'] else 0
+            s.prediction = self._prediction_from_classifier(clf)
             status = 'OCC' if s.prediction else 'FREE'
             m = clf['metrics']
             results.append(
@@ -822,11 +915,6 @@ class AppLogic:
         free = sum(1 for s in self.slots if s.prediction == 0)
         self.status_var.set(
             f"Classification done [{method_name}]: {occ} occupied, {free} free")
-
-        msg = f"Results ({len(self.slots)} slots):\n\n"
-        msg += '\n'.join(results)
-        msg += f"\n\nSummary: {occ} OCC / {free} FREE"
-        messagebox.showinfo(f"ROI Classification Results — {method_name}", msg)
 
     def _warp_roi(self, gray, s: Slot):
         src = np.array(s.pts, dtype=np.float32)
@@ -882,8 +970,12 @@ class AppLogic:
             return
         test_cv = cv2.imread(self.test_path)
         if test_cv is not None:
-            self._display_pil = Image.fromarray(cv2.cvtColor(test_cv, cv2.COLOR_BGR2RGB))
-            self._display_cv = test_cv
+            target_shape = self._roi_space_shape()
+            test_cv, _ = self._resize_to_shape(test_cv, target_shape)
+            self.test_cv = test_cv
+            self.test_pil = Image.fromarray(cv2.cvtColor(test_cv, cv2.COLOR_BGR2RGB))
+            self._display_pil = self.test_pil
+            self._display_cv = self.test_cv
             self._redraw()
             self.status_var.set(f"Showing TEST image: {os.path.basename(self.test_path)}")
 

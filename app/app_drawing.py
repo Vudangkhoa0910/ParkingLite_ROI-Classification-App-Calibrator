@@ -122,7 +122,7 @@ class DrawingMixin:
         b = self._img2canvas(*slot.pts[(edge_i + 1) % 4])
         self.canvas.create_line(a[0], a[1], b[0], b[1],
                                 fill='#ffff00', width=5,
-                                dash=(6, 4), capstyle=self.tk.ROUND,
+                                dash=(6, 4), capstyle=tk.ROUND,
                                 tags='hover_edge')
 
     def _draw_hover_detected_line(self, line_idx):
@@ -131,7 +131,7 @@ class DrawingMixin:
         b = self._img2canvas(x2, y2)
         self.canvas.create_line(a[0], a[1], b[0], b[1],
                                 fill='#00ffcc', width=4,
-                                dash=(4, 2), capstyle=self.tk.ROUND,
+                                dash=(4, 2), capstyle=tk.ROUND,
                                 tags='hover_detected_line')
 
     def _draw_hover_grid_edge(self, edge_i, bounds=None):
@@ -141,7 +141,7 @@ class DrawingMixin:
         b = self._img2canvas(*bounds[(edge_i + 1) % 4])
         self.canvas.create_line(a[0], a[1], b[0], b[1],
                                 fill='#88ff88', width=5,
-                                dash=(4, 2), capstyle=self.tk.ROUND,
+                                dash=(4, 2), capstyle=tk.ROUND,
                                 tags='hover_grid_edge')
 
     def _draw_progress(self, pts, color, prefix, labels=None):
